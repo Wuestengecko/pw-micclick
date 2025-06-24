@@ -12,12 +12,11 @@ use pipewire::keys;
 use pipewire::loop_::Signal;
 use pipewire::main_loop::MainLoop;
 use pipewire::properties::properties;
-use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamRef};
+use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamRef, StreamState};
 use std::mem::{size_of, zeroed};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use thiserror::Error;
 
 #[derive(clap::Parser)]
 struct Args {
@@ -39,20 +38,18 @@ struct Args {
 }
 
 #[derive(Debug, Copy, Clone)]
-enum ThresholdCrossed {
-    Rising,
-    Falling,
+enum MicEvent {
+    Active,
+    Inactive,
+    Suspended,
 }
 
 struct CaptureState {
-    queues: Vec<mpsc::Sender<ThresholdCrossed>>,
+    queues: Vec<mpsc::Sender<MicEvent>>,
     threshold: f32,
     hold_time: Duration,
     falloff: Instant,
     is_on: bool,
-
-    on_sound: Option<Sound>,
-    off_sound: Option<Sound>,
 }
 
 fn main() -> Result<()> {
@@ -60,6 +57,9 @@ fn main() -> Result<()> {
 
     let (tray_sender, tray_receiver) = mpsc::channel();
     let _tray_thread = thread::spawn(move || tray_thread_main(tray_receiver));
+    let (clicker_sender, clicker_receiver) = mpsc::channel();
+    let _clicker_thread =
+        thread::spawn(move || clicker_thread_main(clicker_receiver, args.on_sound, args.off_sound));
 
     let mainloop = MainLoop::new(None)?;
     let context = Context::new(&mainloop)?;
@@ -74,39 +74,26 @@ fn main() -> Result<()> {
         move || mainloop.quit()
     });
 
-    let senders = vec![tray_sender];
-    let _capture = create_capture(&core, senders, &args)?;
+    let senders = vec![tray_sender, clicker_sender];
+    let _capture = create_capture(&core, senders, args.threshold, args.hold_time)?;
 
     mainloop.run();
 
     Ok(())
 }
 
-#[derive(Debug, Error)]
-enum InitError {
-    #[error("{0}")]
-    CannotLoadSound(String),
-}
-
 fn create_capture(
     core: &Core,
-    senders: Vec<mpsc::Sender<ThresholdCrossed>>,
-    args: &Args,
+    senders: Vec<mpsc::Sender<MicEvent>>,
+    threshold: f32,
+    hold_time: Duration,
 ) -> Result<(Stream, StreamListener<CaptureState>)> {
     let state = CaptureState {
         queues: senders,
-        threshold: 10f32.powf(args.threshold / 20.),
-        hold_time: args.hold_time,
+        threshold: 10f32.powf(threshold / 20.),
+        hold_time: hold_time,
         falloff: Instant::now(),
         is_on: false,
-        on_sound: match args.on_sound.as_deref() {
-            Some(path) => Some(Sound::new(path).map_err(|e| InitError::CannotLoadSound(e))?),
-            None => None,
-        },
-        off_sound: match args.off_sound.as_deref() {
-            Some(path) => Some(Sound::new(path).map_err(|e| InitError::CannotLoadSound(e))?),
-            None => None,
-        },
     };
 
     let props = properties! {
@@ -119,6 +106,7 @@ fn create_capture(
     let listener = stream
         .add_local_listener_with_user_data(state)
         .process(on_microphone_frame)
+        .state_changed(on_microphone_state_changed)
         .register()?;
     let mut data = [0 as u8; 1024];
     let mut b: spa_pod_builder = unsafe { zeroed() };
@@ -172,21 +160,15 @@ fn on_microphone_frame(stream: &StreamRef, state: &mut CaptureState) {
         state.falloff = now + state.hold_time;
     }
 
-    let event: ThresholdCrossed;
+    let event: MicEvent;
     match (state.is_on, now <= state.falloff) {
         (false, true) => {
             state.is_on = true;
-            event = ThresholdCrossed::Rising;
-            if let Some(ref mut sound) = state.on_sound {
-                sound.play();
-            }
+            event = MicEvent::Active;
         }
         (true, false) => {
             state.is_on = false;
-            event = ThresholdCrossed::Falling;
-            if let Some(ref mut sound) = state.off_sound {
-                sound.play();
-            }
+            event = MicEvent::Inactive;
         }
         _ => return,
     }
@@ -195,17 +177,83 @@ fn on_microphone_frame(stream: &StreamRef, state: &mut CaptureState) {
     }
 }
 
+fn on_microphone_state_changed(
+    _stream: &StreamRef,
+    state: &mut CaptureState,
+    old: StreamState,
+    new: StreamState,
+) {
+    let event = match (old, new) {
+        (_, StreamState::Error(e)) => panic!("capture stream entered error state: {e:?}"),
+        (StreamState::Paused, StreamState::Streaming) => MicEvent::Inactive,
+        (StreamState::Streaming, StreamState::Paused) => MicEvent::Suspended,
+        _ => return,
+    };
+    for q in state.queues.iter() {
+        q.send(event).expect("cannot send: channel broken");
+    }
+}
+
+fn clicker_thread_main(
+    eventreceiver: mpsc::Receiver<MicEvent>,
+    on_sound: Option<String>,
+    off_sound: Option<String>,
+) {
+    let mut on_sound = match on_sound {
+        Some(path) => load_sound(&path),
+        None => None,
+    };
+    let mut off_sound = match off_sound {
+        Some(path) => load_sound(&path),
+        None => None,
+    };
+
+    let mut is_active = false;
+
+    loop {
+        match eventreceiver.recv() {
+            Ok(MicEvent::Active) => {
+                if !is_active {
+                    if let Some(ref mut sound) = on_sound {
+                        sound.play();
+                    }
+                }
+                is_active = true;
+            }
+            Ok(MicEvent::Inactive | MicEvent::Suspended) => {
+                if is_active {
+                    if let Some(ref mut sound) = off_sound {
+                        sound.play();
+                    }
+                }
+                is_active = false;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn load_sound(path: &str) -> Option<Sound> {
+    match Sound::new(path) {
+        Ok(sound) => Some(sound),
+        Err(e) => {
+            eprintln!("failed to load sound effect from {path:?}: {e}");
+            None
+        }
+    }
+}
+
 static mut INDICATOR_MENU: *mut gtk::Menu = std::ptr::null_mut();
 static mut INDICATOR: *mut AppIndicator = std::ptr::null_mut();
 static INDICATOR_INIT: std::sync::Once = std::sync::Once::new();
 
-fn tray_thread_main(eventreceiver: mpsc::Receiver<ThresholdCrossed>) {
+fn tray_thread_main(eventreceiver: mpsc::Receiver<MicEvent>) {
     gtk::init().expect("gtk::init() failed");
 
     gtk::glib::source::idle_add(move || {
         INDICATOR_INIT.call_once(|| unsafe {
             INDICATOR = Box::into_raw(Box::new(AppIndicator::new("pw-micclick", "")));
-            (*INDICATOR).set_status(AppIndicatorStatus::Active);
+            (*INDICATOR).set_status(AppIndicatorStatus::Passive);
             (*INDICATOR).set_icon_full("microphone-sensitivity-muted-symbolic", "icon");
 
             INDICATOR_MENU = Box::into_raw(Box::new(gtk::Menu::new()));
@@ -215,12 +263,19 @@ fn tray_thread_main(eventreceiver: mpsc::Receiver<ThresholdCrossed>) {
 
         let indicator = unsafe { &mut *INDICATOR };
         match eventreceiver.try_recv() {
-            Ok(ThresholdCrossed::Rising) => {
+            Ok(MicEvent::Active) => {
                 indicator.set_icon_full("microphone-sensitivity-high-symbolic", "icon");
+                indicator.set_status(AppIndicatorStatus::Active);
                 gtk::glib::ControlFlow::Continue
             }
-            Ok(ThresholdCrossed::Falling) => {
+            Ok(MicEvent::Inactive) => {
+                indicator.set_icon_full("microphone-sensitivity-low-symbolic", "icon");
+                indicator.set_status(AppIndicatorStatus::Active);
+                gtk::glib::ControlFlow::Continue
+            }
+            Ok(MicEvent::Suspended) => {
                 indicator.set_icon_full("microphone-sensitivity-muted-symbolic", "icon");
+                indicator.set_status(AppIndicatorStatus::Passive);
                 gtk::glib::ControlFlow::Continue
             }
             Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
