@@ -11,7 +11,8 @@ Wonder no more! With this little program, you will hear an audible click when
 the microphone's captured volume passes some threshold, and another click when
 it stays below the threshold for a brief period of time.
 
-Also features a tray icon.
+Also features a tray icon, which is automatically hidden if nothing is
+capturing audio on your microphone (on tray implementations which support it).
 
 Pairs very well with a [volume gate and/or noise
 suppression](https://github.com/wwmm/easyeffects).
