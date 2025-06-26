@@ -250,7 +250,7 @@ static INDICATOR_INIT: std::sync::Once = std::sync::Once::new();
 fn tray_thread_main(eventreceiver: mpsc::Receiver<MicEvent>) {
     gtk::init().expect("gtk::init() failed");
 
-    gtk::glib::source::idle_add(move || {
+    gtk::glib::source::timeout_add(Duration::from_millis(40), move || {
         INDICATOR_INIT.call_once(|| unsafe {
             INDICATOR = Box::into_raw(Box::new(AppIndicator::new("pw-micclick", "")));
             (*INDICATOR).set_status(AppIndicatorStatus::Passive);
