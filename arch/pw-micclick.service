@@ -1,0 +1,15 @@
+[Unit]
+Requires=pipewire.service pipewire-pulse.service
+After=pipewire.service pipewire-pulse.service pipewire-session-manager.service plasma-xembedsniproxy.service
+
+[Service]
+Type=exec
+Environment=HOLD_TIME=400
+Environment=ON_SOUND=/opt/teamspeak3/sound/default/mic_click_on.wav
+Environment=OFF_SOUND=/opt/teamspeak3/sound/default/mic_click_off.wav
+ExecStart=pw-micclick --hold-time $HOLD_TIME --on-sound $ON_SOUND --off-sound $OFF_SOUND
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
