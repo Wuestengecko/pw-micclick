@@ -1,0 +1,100 @@
+# vim:set ft=yaml fdm=marker:
+name: Build and test
+
+on:
+  push:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build: # {{{1
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_HOME: ${{forge.workspace}}/cargohome
+      MAKEFLAGS: j4
+      PACKAGER: "Wüstengecko <wuestengecko@treehouseofmetal.ninja>"
+      PKGEXT: .pkg.tar.zst
+      PKGDEST: ${{forge.workspace}}/pkgdest
+      SRCDEST: ${{forge.workspace}}/srcdest
+    steps:
+      - id: get-date
+        run: |-
+          date -u +'ymd=%Y%m%d' >> "$FORGEJO_OUTPUT"
+          date -u +'ym=%Y%m' >> "$FORGEJO_OUTPUT"
+          date -u +'y=%Y' >> "$FORGEJO_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          key: pacman-${{steps.get-date.outputs.ymd}}
+          path: ${{forge.workspace}}/pkgcache/
+          restore-keys: |-
+            pacman-${{steps.get-date.outputs.ym}}
+            pacman-${{steps.get-date.outputs.y}}
+            pacman-
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          path: repo
+      - uses: actions/cache@v4
+        with:
+          key: cargo-${{runner.os}}-${{hashFiles('**/Cargo.lock')}}
+          restore-keys: cargo-${{runner.os}}-
+          path: |
+            cargohome/bin/
+            cargohome/registry/index/
+            cargohome/registry/cache/
+            cargohome/git/db/
+            srcdest/
+            target/
+      - name: Build in an Arch container
+        uses: docker://docker.io/library/archlinux:base-devel
+        with:
+          args: |-
+            bash -ec '
+            echo ::group::Update the base system
+            sed -i -e "/^\[options\]$/aCacheDir = $FORGEJO_WORKSPACE/pkgcache" /etc/pacman.conf
+            pacman -Syu --noconfirm base-devel pacman-contrib
+            echo ::endgroup::
+
+            echo ::group::Prepare the build environment
+            useradd -mk/dev/null builduser
+            echo "builduser ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/builduser
+            chown -R builduser:builduser "$FORGEJO_WORKSPACE"
+            echo ::endgroup::
+
+            echo ::group::Build the package
+            (cd repo/arch && sudo -Eubuilduser -- makepkg --syncdeps --noconfirm)
+            echo ::endgroup::
+
+            echo ::group::Clean up package cache
+            paccache --remove --keep 1 --verbose
+            echo ::endgroup::
+            '
+      - uses: forgejo/upload-artifact@v4
+        with:
+          name: arch-packages
+          path: pkgdest/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  upload: # {{{1
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: forgejo/download-artifact@v4
+        with:
+          name: arch-packages
+      - run: |-
+          pkgfiles=(*.pkg.tar.zst)
+          for pkgfile in "${pkgfiles[@]}"; do
+            curl -X PUT "$UPLOAD_URL" --user "$UPLOAD_USER" --header 'Content-Type: application/octet-stream' --data-binary "@$pkgfile"
+          done
+        env:
+          UPLOAD_URL: ${{forge.server_url}}/api/packages/${{forge.repository_owner}}/arch/custom
+          UPLOAD_USER: ${{forge.repository_owner}}:${{forge.token}}

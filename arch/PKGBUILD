@@ -1,0 +1,39 @@
+#!/hint/bash -e
+pkgname=pw-micclick-git
+pkgver=r0
+pkgrel=1
+pkgdesc="Makes clicking sounds when you start or stop talking"
+arch=('i686' 'x86_64' 'armv6h' 'armv7h')
+url="https://github.com/wuestengecko/pw-micclick"
+license=('MIT')
+depends=(pipewire clang gtk3 openal libsndfile)
+makedepends=(cargo git)
+optdepends=('teamspeak3: Default on/off click sounds')
+options=(!lto)
+source=("${url##*/}::git+file://${PWD%/*}/.git"
+  pw-micclick.service)
+md5sums=('SKIP' 'SKIP')
+
+pkgver() {
+  cd "$srcdir/${pkgname%-*}"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$srcdir/${pkgname%-*}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/${pkgname%-*}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-features
+}
+
+package() {
+  cd "$srcdir/${pkgname%-*}"
+  install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/${pkgname%-*}"
+  install -Dm0644 -t "$pkgdir/usr/lib/systemd/user/" "$srcdir/pw-micclick.service"
+}
